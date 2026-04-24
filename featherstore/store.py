@@ -1,29 +1,29 @@
-"""Core FeatherStore class — lightweight local feature store backed by DuckDB + Parquet."""
+"""Core FeatherStore — save/load Pandas DataFrames as Parquet with DuckDB queries."""
 
 from __future__ import annotations
 
-import shutil
+import json
 from pathlib import Path
-from typing import Any
+from typing import List, Optional
 
 import duckdb
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 
-from featherstore.lineage import get_lineage, record_lineage
-from featherstore.tags import add_tag, list_tags, remove_tag
-from featherstore.versioning import get_version_history, record_version
-
-_CATALOG_DB = "catalog.duckdb"
+from featherstore.versioning import record_version
+from featherstore.lineage import record_lineage
+from featherstore.snapshots import create_snapshot, restore_snapshot, list_snapshots
 
 
 class FeatherStore:
-    """Lightweight local feature store for rapid ML experimentation."""
+    """Lightweight local feature store backed by Parquet files."""
 
     def __init__(self, store_path: str | Path) -> None:
         self.store_path = Path(store_path)
-        self.store_path.mkdir(parents=True, exist_ok=True)
-        self._db_path = self.store_path / _CATALOG_DB
-        self._con = duckdb.connect(str(self._db_path))
+        self._meta_dir = self.store_path / ".featherstore"
+        self._meta_dir.mkdir(parents=True, exist_ok=True)
+        self._catalog_path = self._meta_dir / "catalog.json"
         self._init_catalog()
 
     # ------------------------------------------------------------------
@@ -31,15 +31,14 @@ class FeatherStore:
     # ------------------------------------------------------------------
 
     def _init_catalog(self) -> None:
-        self._con.execute(
-            """
-            CREATE TABLE IF NOT EXISTS catalog (
-                group_name TEXT PRIMARY KEY,
-                parquet_path TEXT NOT NULL,
-                created_at TEXT NOT NULL
-            )
-            """
-        )
+        if not self._catalog_path.exists():
+            self._catalog_path.write_text(json.dumps({}), encoding="utf-8")
+
+    def _load_catalog(self) -> dict:
+        return json.loads(self._catalog_path.read_text(encoding="utf-8"))
+
+    def _save_catalog(self, catalog: dict) -> None:
+        self._catalog_path.write_text(json.dumps(catalog, indent=2), encoding="utf-8")
 
     def _group_dir(self, group: str) -> Path:
         return self.store_path / group
@@ -48,89 +47,84 @@ class FeatherStore:
         return self._group_dir(group) / "data.parquet"
 
     # ------------------------------------------------------------------
-    # Core I/O
+    # Save / Load
     # ------------------------------------------------------------------
 
     def save(
         self,
-        group: str,
         df: pd.DataFrame,
+        group: str,
         *,
-        tags: list[str] | None = None,
-        source: str | None = None,
-        transform: str | None = None,
-        parents: list[str] | None = None,
-        lineage_extra: dict[str, Any] | None = None,
+        tags: Optional[List[str]] = None,
+        source: Optional[str] = None,
+        transform: Optional[str] = None,
     ) -> None:
-        """Persist a DataFrame as a named feature group."""
-        group_dir = self._group_dir(group)
-        group_dir.mkdir(parents=True, exist_ok=True)
-        parquet_path = self._parquet_path(group)
-        df.to_parquet(parquet_path, index=False)
+        """Persist *df* under *group*, updating catalog, versioning, and lineage."""
+        dest = self._parquet_path(group)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        table = pa.Table.from_pandas(df, preserve_index=False)
+        pq.write_table(table, dest)
 
-        rel_path = str(parquet_path.relative_to(self.store_path))
-        self._con.execute(
-            """
-            INSERT INTO catalog (group_name, parquet_path, created_at)
-            VALUES (?, ?, strftime('%Y-%m-%dT%H:%M:%S', 'now'))
-            ON CONFLICT (group_name) DO UPDATE SET
-                parquet_path = excluded.parquet_path,
-                created_at = excluded.created_at
-            """,
-            [group, rel_path],
-        )
+        catalog = self._load_catalog()
+        catalog[group] = {
+            "columns": df.columns.tolist(),
+            "rows": len(df),
+            "tags": tags or [],
+        }
+        self._save_catalog(catalog)
 
-        record_version(self.store_path, group, {"rows": len(df), "columns": list(df.columns)})
+        record_version(self.store_path, group, {"rows": len(df), "columns": df.columns.tolist()})
 
-        if tags:
-            for tag in tags:
-                add_tag(self.store_path, group, tag)
-
-        if any(v is not None for v in (source, transform, parents, lineage_extra)):
+        if source or transform:
             record_lineage(
                 self.store_path,
                 group,
                 source=source,
                 transform=transform,
-                parents=parents,
-                extra=lineage_extra,
             )
 
-    def load(self, group: str, columns: list[str] | None = None) -> pd.DataFrame:
-        """Load a feature group by name, optionally selecting columns."""
-        row = self._con.execute(
-            "SELECT parquet_path FROM catalog WHERE group_name = ?", [group]
-        ).fetchone()
-        if row is None:
-            raise KeyError(f"Feature group '{group}' not found in store.")
-        parquet_path = self.store_path / row[0]
-        df = pd.read_parquet(parquet_path, columns=columns)
-        return df
+    def load(
+        self,
+        group: str,
+        columns: Optional[List[str]] = None,
+    ) -> pd.DataFrame:
+        """Load features for *group*, optionally selecting *columns*."""
+        path = self._parquet_path(group)
+        if not path.exists():
+            raise KeyError(f"Group '{group}' not found in store at {self.store_path}")
+        table = pq.read_table(path, columns=columns)
+        return table.to_pandas()
 
-    def delete(self, group: str) -> None:
-        """Remove a feature group and all associated data."""
-        self._con.execute("DELETE FROM catalog WHERE group_name = ?", [group])
-        group_dir = self._group_dir(group)
-        if group_dir.exists():
-            shutil.rmtree(group_dir)
+    def query(self, sql: str) -> pd.DataFrame:
+        """Run an arbitrary DuckDB SQL query against all parquet files in the store."""
+        con = duckdb.connect()
+        catalog = self._load_catalog()
+        for group in catalog:
+            parquet_file = str(self._parquet_path(group))
+            safe_name = group.replace("/", "__")
+            con.execute(f"CREATE VIEW {safe_name} AS SELECT * FROM read_parquet('{parquet_file}')")
+        return con.execute(sql).df()
 
     # ------------------------------------------------------------------
-    # Metadata helpers
+    # Snapshot convenience wrappers
     # ------------------------------------------------------------------
 
-    def get_tags(self, group: str) -> list[str]:
-        return list_tags(self.store_path, group)
+    def snapshot(self, group: str, snapshot_name: str) -> dict:
+        """Create a named snapshot of the current state of *group*."""
+        return create_snapshot(self.store_path, group, snapshot_name)
 
-    def tag(self, group: str, tag: str) -> None:
-        add_tag(self.store_path, group, tag)
+    def restore(self, group: str, snapshot_name: str) -> None:
+        """Restore *group* to a previously created snapshot."""
+        restore_snapshot(self.store_path, group, snapshot_name)
 
-    def untag(self, group: str, tag: str) -> None:
-        remove_tag(self.store_path, group, tag)
+    def list_snapshots(self, group: str) -> list[dict]:
+        """Return all snapshots for *group* sorted by creation time."""
+        return list_snapshots(self.store_path, group)
 
-    def get_lineage(self, group: str) -> dict[str, Any] | None:
-        """Return recorded lineage metadata for a feature group."""
-        return get_lineage(self.store_path, group)
+    # ------------------------------------------------------------------
+    # Misc
+    # ------------------------------------------------------------------
 
-    def get_history(self, group: str) -> list[dict[str, Any]]:
-        """Return version history for a feature group."""
-        return get_version_history(self.store_path, group)
+    def groups(self) -> List[str]:
+        """Return all registered group names."""
+        return list(self._load_catalog().keys())

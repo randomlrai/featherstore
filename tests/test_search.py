@@ -84,3 +84,11 @@ def test_search_combined_tag_and_name(populated_store):
 def test_search_empty_store(store):
     results = list_groups(store._catalog, store.path)
     assert results == []
+
+
+def test_search_by_name_contains_no_match(populated_store):
+    """Searching for a substring that matches no group name returns an empty list."""
+    results = search_catalog(
+        populated_store._catalog, populated_store.path, name_contains="nonexistent"
+    )
+    assert results == []

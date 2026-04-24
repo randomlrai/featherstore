@@ -21,7 +21,15 @@ def search_catalog(
 
     Returns:
         List of matching catalog entry dicts with 'group' key added.
+
+    Raises:
+        TypeError: If catalog is not a dict or store_path is not a string.
     """
+    if not isinstance(catalog, dict):
+        raise TypeError(f"catalog must be a dict, got {type(catalog).__name__}")
+    if not isinstance(store_path, str):
+        raise TypeError(f"store_path must be a str, got {type(store_path).__name__}")
+
     tagged_groups = None
     if tag is not None:
         tagged_groups = set(find_groups_by_tag(store_path, tag))

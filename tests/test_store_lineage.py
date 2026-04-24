@@ -68,3 +68,8 @@ def test_lineage_survives_overwrite(store, sample_df):
     store.save("g", sample_df, source="v2")
     lineage = store.get_lineage("g")
     assert lineage["source"] == "v2"
+
+
+def test_get_lineage_for_unknown_key_returns_none(store):
+    """Requesting lineage for a dataset that was never saved should return None."""
+    assert store.get_lineage("does_not_exist") is None

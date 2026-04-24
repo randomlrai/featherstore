@@ -1,110 +1,136 @@
-"""Core FeatherStore class for managing feature groups using DuckDB and Parquet."""
+"""Core FeatherStore class — lightweight local feature store backed by DuckDB + Parquet."""
 
-import os
+from __future__ import annotations
+
+import shutil
 from pathlib import Path
-from typing import Optional
+from typing import Any
 
 import duckdb
 import pandas as pd
 
+from featherstore.lineage import get_lineage, record_lineage
+from featherstore.tags import add_tag, list_tags, remove_tag
+from featherstore.versioning import get_version_history, record_version
+
+_CATALOG_DB = "catalog.duckdb"
+
 
 class FeatherStore:
-    """Lightweight local feature store backed by DuckDB and Parquet files."""
+    """Lightweight local feature store for rapid ML experimentation."""
 
-    def __init__(self, store_path: str = ".featherstore"):
-        """
-        Initialize the feature store.
-
-        Args:
-            store_path: Directory where feature groups (Parquet files) are stored.
-        """
+    def __init__(self, store_path: str | Path) -> None:
         self.store_path = Path(store_path)
         self.store_path.mkdir(parents=True, exist_ok=True)
-        self._conn = duckdb.connect(database=str(self.store_path / "catalog.duckdb"))
+        self._db_path = self.store_path / _CATALOG_DB
+        self._con = duckdb.connect(str(self._db_path))
         self._init_catalog()
 
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
     def _init_catalog(self) -> None:
-        """Create the feature group catalog table if it doesn't exist."""
-        self._conn.execute(
+        self._con.execute(
             """
-            CREATE TABLE IF NOT EXISTS feature_groups (
-                name        VARCHAR PRIMARY KEY,
-                path        VARCHAR NOT NULL,
-                created_at  TIMESTAMP DEFAULT current_timestamp,
-                description VARCHAR
+            CREATE TABLE IF NOT EXISTS catalog (
+                group_name TEXT PRIMARY KEY,
+                parquet_path TEXT NOT NULL,
+                created_at TEXT NOT NULL
             )
             """
         )
 
-    def save(self, name: str, df: pd.DataFrame, description: str = "") -> None:
-        """
-        Save a DataFrame as a named feature group.
+    def _group_dir(self, group: str) -> Path:
+        return self.store_path / group
 
-        Args:
-            name: Unique name for the feature group.
-            df: DataFrame containing the features.
-            description: Optional human-readable description.
-        """
-        parquet_path = self.store_path / f"{name}.parquet"
+    def _parquet_path(self, group: str) -> Path:
+        return self._group_dir(group) / "data.parquet"
+
+    # ------------------------------------------------------------------
+    # Core I/O
+    # ------------------------------------------------------------------
+
+    def save(
+        self,
+        group: str,
+        df: pd.DataFrame,
+        *,
+        tags: list[str] | None = None,
+        source: str | None = None,
+        transform: str | None = None,
+        parents: list[str] | None = None,
+        lineage_extra: dict[str, Any] | None = None,
+    ) -> None:
+        """Persist a DataFrame as a named feature group."""
+        group_dir = self._group_dir(group)
+        group_dir.mkdir(parents=True, exist_ok=True)
+        parquet_path = self._parquet_path(group)
         df.to_parquet(parquet_path, index=False)
 
-        self._conn.execute(
+        rel_path = str(parquet_path.relative_to(self.store_path))
+        self._con.execute(
             """
-            INSERT INTO feature_groups (name, path, description)
-            VALUES (?, ?, ?)
-            ON CONFLICT (name) DO UPDATE SET
-                path = excluded.path,
-                description = excluded.description,
-                created_at = current_timestamp
+            INSERT INTO catalog (group_name, parquet_path, created_at)
+            VALUES (?, ?, strftime('%Y-%m-%dT%H:%M:%S', 'now'))
+            ON CONFLICT (group_name) DO UPDATE SET
+                parquet_path = excluded.parquet_path,
+                created_at = excluded.created_at
             """,
-            [name, str(parquet_path), description],
+            [group, rel_path],
         )
 
-    def load(self, name: str, columns: Optional[list] = None) -> pd.DataFrame:
-        """
-        Load a feature group by name.
+        record_version(self.store_path, group, {"rows": len(df), "columns": list(df.columns)})
 
-        Args:
-            name: Name of the feature group to load.
-            columns: Optional list of columns to select.
+        if tags:
+            for tag in tags:
+                add_tag(self.store_path, group, tag)
 
-        Returns:
-            DataFrame with the requested features.
-        """
-        row = self._conn.execute(
-            "SELECT path FROM feature_groups WHERE name = ?", [name]
-        ).fetchone()
+        if any(v is not None for v in (source, transform, parents, lineage_extra)):
+            record_lineage(
+                self.store_path,
+                group,
+                source=source,
+                transform=transform,
+                parents=parents,
+                extra=lineage_extra,
+            )
 
-        if row is None:
-            raise KeyError(f"Feature group '{name}' not found in store.")
-
-        parquet_path = row[0]
-        col_expr = ", ".join(columns) if columns else "*"
-        return self._conn.execute(
-            f"SELECT {col_expr} FROM read_parquet('{parquet_path}')"
-        ).df()
-
-    def list_groups(self) -> pd.DataFrame:
-        """Return a DataFrame listing all registered feature groups."""
-        return self._conn.execute(
-            "SELECT name, description, created_at FROM feature_groups ORDER BY name"
-        ).df()
-
-    def delete(self, name: str) -> None:
-        """Remove a feature group from the store."""
-        row = self._conn.execute(
-            "SELECT path FROM feature_groups WHERE name = ?", [name]
+    def load(self, group: str, columns: list[str] | None = None) -> pd.DataFrame:
+        """Load a feature group by name, optionally selecting columns."""
+        row = self._con.execute(
+            "SELECT parquet_path FROM catalog WHERE group_name = ?", [group]
         ).fetchone()
         if row is None:
-            raise KeyError(f"Feature group '{name}' not found in store.")
-        parquet_path = Path(row[0])
-        if parquet_path.exists():
-            parquet_path.unlink()
-        self._conn.execute("DELETE FROM feature_groups WHERE name = ?", [name])
+            raise KeyError(f"Feature group '{group}' not found in store.")
+        parquet_path = self.store_path / row[0]
+        df = pd.read_parquet(parquet_path, columns=columns)
+        return df
 
-    def close(self) -> None:
-        """Close the underlying DuckDB connection."""
-        self._conn.close()
+    def delete(self, group: str) -> None:
+        """Remove a feature group and all associated data."""
+        self._con.execute("DELETE FROM catalog WHERE group_name = ?", [group])
+        group_dir = self._group_dir(group)
+        if group_dir.exists():
+            shutil.rmtree(group_dir)
 
-    def __repr__(self) -> str:
-        return f"FeatherStore(store_path='{self.store_path}')"
+    # ------------------------------------------------------------------
+    # Metadata helpers
+    # ------------------------------------------------------------------
+
+    def get_tags(self, group: str) -> list[str]:
+        return list_tags(self.store_path, group)
+
+    def tag(self, group: str, tag: str) -> None:
+        add_tag(self.store_path, group, tag)
+
+    def untag(self, group: str, tag: str) -> None:
+        remove_tag(self.store_path, group, tag)
+
+    def get_lineage(self, group: str) -> dict[str, Any] | None:
+        """Return recorded lineage metadata for a feature group."""
+        return get_lineage(self.store_path, group)
+
+    def get_history(self, group: str) -> list[dict[str, Any]]:
+        """Return version history for a feature group."""
+        return get_version_history(self.store_path, group)

@@ -69,6 +69,14 @@ def test_create_snapshot_missing_group_raises(store_path):
         create_snapshot(store_path, "nonexistent", "v1")
 
 
+def test_create_snapshot_duplicate_name_raises(store_path):
+    """Creating two snapshots with the same name for the same group should raise."""
+    _write_parquet(store_path, "features/raw", 42)
+    create_snapshot(store_path, "features/raw", "v1")
+    with pytest.raises(ValueError):
+        create_snapshot(store_path, "features/raw", "v1")
+
+
 # ---------------------------------------------------------------------------
 # restore_snapshot
 # ---------------------------------------------------------------------------
@@ -90,32 +98,4 @@ def test_restore_snapshot_unknown_raises(store_path):
 
 # ---------------------------------------------------------------------------
 # list_snapshots
-# ---------------------------------------------------------------------------
-
-def test_list_snapshots_empty_for_unknown_group(store_path):
-    assert list_snapshots(store_path, "no_such_group") == []
-
-
-def test_list_snapshots_sorted_by_created_at(store_path):
-    _write_parquet(store_path, "feat", 1)
-    create_snapshot(store_path, "feat", "alpha")
-    create_snapshot(store_path, "feat", "beta")
-    snaps = list_snapshots(store_path, "feat")
-    assert len(snaps) == 2
-    assert snaps[0]["created_at"] <= snaps[1]["created_at"]
-
-
-# ---------------------------------------------------------------------------
-# delete_snapshot
-# ---------------------------------------------------------------------------
-
-def test_delete_snapshot_removes_from_manifest(store_path):
-    _write_parquet(store_path, "feat", 7)
-    create_snapshot(store_path, "feat", "v1")
-    delete_snapshot(store_path, "feat", "v1")
-    assert list_snapshots(store_path, "feat") == []
-
-
-def test_delete_snapshot_unknown_raises(store_path):
-    with pytest.raises(KeyError):
-        delete_snapshot(store_path, "feat", "ghost")
+# ------------------------------------

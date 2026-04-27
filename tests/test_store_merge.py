@@ -72,3 +72,10 @@ def test_merge_with_column_subset(store, sample_users, sample_labels):
     assert "label" in result.columns
     # 'user_id' used as join key should still be present
     assert "user_id" in result.columns
+
+
+def test_merge_nonexistent_group_raises(store, sample_users):
+    """Merging with a group name that does not exist should raise an error."""
+    store.save("users", sample_users)
+    with pytest.raises(KeyError):
+        store.merge(["users", "nonexistent"], on=["user_id"], how="inner")

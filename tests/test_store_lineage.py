@@ -73,3 +73,15 @@ def test_lineage_survives_overwrite(store, sample_df):
 def test_get_lineage_for_unknown_key_returns_none(store):
     """Requesting lineage for a dataset that was never saved should return None."""
     assert store.get_lineage("does_not_exist") is None
+
+
+def test_save_with_multiple_parents_records_all(store, sample_df):
+    """All parent dataset names should be preserved when multiple parents are given."""
+    store.save("parent_a", sample_df)
+    store.save("parent_b", sample_df)
+    store.save("child", sample_df, parents=["parent_a", "parent_b"])
+    lineage = store.get_lineage("child")
+    assert lineage is not None
+    assert "parent_a" in lineage["parents"]
+    assert "parent_b" in lineage["parents"]
+    assert len(lineage["parents"]) == 2

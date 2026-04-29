@@ -50,6 +50,12 @@ def test_sample_fraction_bad_stratify_col_raises(base_df):
         sample_fraction(base_df, frac=0.5, stratify_col="nonexistent")
 
 
+def test_sample_fraction_no_duplicates_by_default(base_df):
+    """Without replacement, sampled rows should be unique."""
+    result = sample_fraction(base_df, frac=0.5, seed=0)
+    assert result.index.duplicated().sum() == 0
+
+
 # ------------------------------------------------------------------ #
 # sample_n                                                             #
 # ------------------------------------------------------------------ #
@@ -80,6 +86,12 @@ def test_sample_n_negative_raises(base_df):
         sample_n(base_df, n=-1)
 
 
+def test_sample_n_zero_raises(base_df):
+    """Requesting zero rows should raise a ValueError."""
+    with pytest.raises(ValueError):
+        sample_n(base_df, n=0)
+
+
 # ------------------------------------------------------------------ #
 # bootstrap_sample                                                     #
 # ------------------------------------------------------------------ #
@@ -95,6 +107,13 @@ def test_bootstrap_custom_n(base_df):
 
 
 def test_bootstrap_reproducible(base_df):
+    """Bootstrap samples with the same seed should be identical."""
     r1 = bootstrap_sample(base_df, seed=5)
     r2 = bootstrap_sample(base_df, seed=5)
     pd.testing.assert_frame_equal(r1, r2)
+
+
+def test_bootstrap_contains_duplicates(base_df):
+    """A bootstrap sample drawn with replacement should typically contain duplicate rows."""
+    result = bootstrap_sample(base_df, seed=0)
+    assert result.index.duplicated().sum() > 0

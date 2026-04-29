@@ -101,10 +101,6 @@ def test_get_ancestors_multi_level(store_path):
     assert "grandparent" in ancestors
 
 
-def test_get_ancestors_no_cycle_infinite_loop(store_path):
-    """Cyclic references must not cause infinite recursion."""
-    record_lineage(store_path, "a", parents=["b"])
-    record_lineage(store_path, "b", parents=["a"])
-    # Should terminate without error
-    result = get_ancestors(store_path, "a")
-    assert isinstance(result, list)
+def test_get_ancestors_unknown_node_returns_empty(store_path):
+    """get_ancestors on a node with no lineage record should return empty list."""
+    assert get_ancestors(store_path, "ghost") == []

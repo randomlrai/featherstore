@@ -52,7 +52,13 @@ def register_schedule(
     -------
     dict
         The newly created / updated schedule entry.
+
+    Raises
+    ------
+    ValueError
+        If *cron* is not a string with exactly 5 space-separated fields.
     """
+    _validate_cron(cron)
     schedules = load_schedules(store_path)
     entry: dict[str, Any] = {
         "group": group,
@@ -64,6 +70,15 @@ def register_schedule(
     schedules[group] = entry
     save_schedules(store_path, schedules)
     return entry
+
+
+def _validate_cron(cron: str) -> None:
+    """Raise *ValueError* if *cron* does not look like a 5-field cron expression."""
+    if not isinstance(cron, str) or len(cron.split()) != 5:
+        raise ValueError(
+            f"Invalid cron expression {cron!r}: expected exactly 5 space-separated fields "
+            "(minute hour day-of-month month day-of-week)."
+        )
 
 
 def remove_schedule(store_path: str, group: str) -> bool:

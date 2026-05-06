@@ -1,19 +1,13 @@
-"""FeatherStore — core store class (updated to include BadgeMixin)."""
+"""FeatherStore — core store class assembling all mixins."""
 
 import json
-import shutil
 from pathlib import Path
 
 import duckdb
 import pandas as pd
-import pyarrow as pa
 import pyarrow.parquet as pq
+import pyarrow as pa
 
-from featherstore.versioning import record_version, get_version_history
-from featherstore.tags import add_tag, load_tags
-from featherstore.lineage import record_lineage, get_lineage
-from featherstore.snapshots import create_snapshot, load_snapshots
-from featherstore.stats import record_stats, load_stats
 from featherstore.store_export import ExportMixin
 from featherstore.store_merge import MergeMixin
 from featherstore.store_profile import ProfileMixin
@@ -38,6 +32,11 @@ from featherstore.store_alert import AlertMixin
 from featherstore.store_annotation import AnnotationMixin
 from featherstore.store_watchlist import WatchlistMixin
 from featherstore.store_badge import BadgeMixin
+from featherstore.store_category import CategoryMixin
+from featherstore.store_trust import TrustMixin
+from featherstore.store_score import ScoreMixin
+from featherstore.store_flag import FlagMixin
+from featherstore.store_visibility import VisibilityMixin
 
 
 class FeatherStore(
@@ -65,87 +64,103 @@ class FeatherStore(
     AnnotationMixin,
     WatchlistMixin,
     BadgeMixin,
+    CategoryMixin,
+    TrustMixin,
+    ScoreMixin,
+    FlagMixin,
+    VisibilityMixin,
 ):
+    """Lightweight local feature store backed by DuckDB and Parquet."""
+
     def __init__(self, store_path: str):
         self.store_path = store_path
         Path(store_path).mkdir(parents=True, exist_ok=True)
-        self._init_catalog()
+        self._catalog = self._load_catalog()
 
-    def _init_catalog(self):
-        meta_dir = Path(self.store_path) / ".featherstore"
-        meta_dir.mkdir(exist_ok=True)
-        if not self._catalog_path.exists():
-            self._catalog_path.write_text(json.dumps({}))
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
 
-    @property
     def _catalog_path(self) -> Path:
-        return Path(self.store_path) / ".featherstore" / "catalog.json"
+        return Path(self.store_path) / "_catalog.json"
 
     def _load_catalog(self) -> dict:
-        return json.loads(self._catalog_path.read_text())
+        p = self._catalog_path()
+        if p.exists():
+            with open(p) as f:
+                return json.load(f)
+        return {}
 
-    def _save_catalog(self, catalog: dict) -> None:
-        self._catalog_path.write_text(json.dumps(catalog, indent=2))
+    def _save_catalog(self) -> None:
+        with open(self._catalog_path(), "w") as f:
+            json.dump(self._catalog, f, indent=2)
 
-    def _group_path(self, group: str) -> Path:
+    def _group_dir(self, group: str) -> Path:
         return Path(self.store_path) / group
 
     def _parquet_path(self, group: str) -> Path:
-        return self._group_path(group) / "data.parquet"
+        return self._group_dir(group) / "data.parquet"
 
-    def save(self, group: str, df: pd.DataFrame, tags: list = None,
-             source: str = None, transform: str = None) -> None:
-        group_dir = self._group_path(group)
+    # ------------------------------------------------------------------
+    # Core save / load
+    # ------------------------------------------------------------------
+
+    def save(
+        self,
+        group: str,
+        df: pd.DataFrame,
+        source: str | None = None,
+        transform: str | None = None,
+        compression: str = "snappy",
+    ) -> None:
+        """Persist a DataFrame as a named feature group."""
+        group_dir = self._group_dir(group)
         group_dir.mkdir(parents=True, exist_ok=True)
         table = pa.Table.from_pandas(df)
-        pq.write_table(table, self._parquet_path(group))
-        catalog = self._load_catalog()
-        catalog[group] = {"columns": list(df.columns), "rows": len(df)}
-        self._save_catalog(catalog)
-        record_version(self.store_path, group, metadata={"rows": len(df), "cols": len(df.columns)})
-        record_stats(self.store_path, group, df)
-        if tags:
-            for tag in tags:
-                add_tag(self.store_path, group, tag)
-        if source or transform:
-            record_lineage(self.store_path, group, source=source, transform=transform)
+        pq.write_table(table, self._parquet_path(group), compression=compression)
+        self._catalog[group] = {
+            "columns": list(df.columns),
+            "rows": len(df),
+            "compression": compression,
+        }
+        self._save_catalog()
 
-    def load(self, group: str, columns: list = None) -> pd.DataFrame:
-        if not self._parquet_path(group).exists():
+        # Optional integrations
+        from featherstore import lineage as _lineage
+        from featherstore import stats as _stats
+        from featherstore import versioning as _versioning
+
+        if source or transform:
+            _lineage.record_lineage(self.store_path, group, source=source, transform=transform)
+        _stats.record_stats(self.store_path, group, df)
+        _versioning.record_version(self.store_path, group, metadata={"rows": len(df), "columns": len(df.columns)})
+
+    def load(
+        self,
+        group: str,
+        columns: list[str] | None = None,
+    ) -> pd.DataFrame:
+        """Load a feature group from the store."""
+        if group not in self._catalog:
             raise KeyError(f"Group '{group}' not found in store.")
-        con = duckdb.connect()
         path = str(self._parquet_path(group))
-        if columns:
-            cols = ", ".join(f'"{c}"' for c in columns)
-            query = f"SELECT {cols} FROM read_parquet('{path}')"
-        else:
-            query = f"SELECT * FROM read_parquet('{path}')"
+        query = f"SELECT {', '.join(columns) if columns else '*'} FROM read_parquet('{path}')"
+        con = duckdb.connect()
         return con.execute(query).df()
 
     def delete(self, group: str) -> None:
-        group_dir = self._group_path(group)
-        if group_dir.exists():
-            shutil.rmtree(group_dir)
-        catalog = self._load_catalog()
-        catalog.pop(group, None)
-        self._save_catalog(catalog)
+        """Remove a feature group from the store."""
+        import shutil
+        if group not in self._catalog:
+            raise KeyError(f"Group '{group}' not found in store.")
+        shutil.rmtree(self._group_dir(group))
+        del self._catalog[group]
+        self._save_catalog()
 
-    def list_groups(self) -> list:
-        return list(self._load_catalog().keys())
+    def list_groups(self) -> list[str]:
+        """Return all saved group names."""
+        return list(self._catalog.keys())
 
-    def get_version_history(self, group: str) -> list:
-        return get_version_history(self.store_path, group)
-
-    def get_lineage(self, group: str):
-        return get_lineage(self.store_path, group)
-
-    def snapshot(self, group: str, label: str = None) -> dict:
-        return create_snapshot(self.store_path, group, label=label)
-
-    def list_snapshots(self, group: str) -> list:
-        snaps = load_snapshots(self.store_path)
-        return snaps.get(group, [])
-
-    def get_stats(self, group: str):
-        stats = load_stats(self.store_path)
-        return stats.get(group)
+    def _init_catalog(self) -> None:
+        self._catalog = {}
+        self._save_catalog()
